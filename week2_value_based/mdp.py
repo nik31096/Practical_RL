@@ -358,6 +358,7 @@ def plot_graph_with_state_values(mdp, state_values):
 
 def get_optimal_action_for_plot(mdp, state_values, state, gamma=0.9):
     """ Finds optimal action using formula above. """
+    global get_action_value
     if mdp.is_terminal(state): return None
     next_actions = mdp.get_possible_actions(state)
     q_values = [get_action_value(mdp, state_values, state, action, gamma) for
@@ -368,6 +369,8 @@ def get_optimal_action_for_plot(mdp, state_values, state, gamma=0.9):
 
 def plot_graph_optimal_strategy_and_state_values(mdp, state_values):
     """ Plot graph with state values and """
+    global gamma
+    global get_action_value
     graph = plot_graph(mdp)
     opt_s_a_edge_attrs = {'style': 'bold',
                           'color': 'green',
