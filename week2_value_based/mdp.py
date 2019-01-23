@@ -4,6 +4,7 @@ import sys
 import random
 import numpy as np
 
+
 try:
     from IPython.display import display
     from graphviz import Digraph
@@ -367,10 +368,8 @@ def get_optimal_action_for_plot(mdp, state_values, state, gamma=0.9):
     return optimal_action
 
 
-def plot_graph_optimal_strategy_and_state_values(mdp, state_values):
+def plot_graph_optimal_strategy_and_state_values(mdp, state_values, gamma):
     """ Plot graph with state values and """
-    global gamma
-    global get_action_value
     graph = plot_graph(mdp)
     opt_s_a_edge_attrs = {'style': 'bold',
                           'color': 'green',
@@ -389,3 +388,13 @@ def plot_graph_optimal_strategy_and_state_values(mdp, state_values):
                 graph.edge(state_node, state_node + "-" + action,
                            **opt_s_a_edge_attrs)
     return display(graph)
+
+
+def get_action_value(mdp, state_values, state, action, gamma):
+    """ Computes Q(s,a) """
+
+    q_s_a = sum([mdp.get_transition_prob(state, action, next_state)*
+                 (mdp.get_reward(state, action, next_state) + gamma*state_values[next_state]) 
+                 for next_state in state_values.keys()])
+
+    return q_s_a
