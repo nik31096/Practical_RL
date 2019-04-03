@@ -1,0 +1,647 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# REINFORCE in pytorch\n",
+    "\n",
+    "Just like we did before for q-learning, this time we'll design a lasagne network to learn `CartPole-v0` via policy gradient (REINFORCE).\n",
+    "\n",
+    "Most of the code in this notebook is taken from approximate qlearning, so you'll find it more or less familiar and even simpler."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "env: THEANO_FLAGS='floatX=float32'\n"
+     ]
+    }
+   ],
+   "source": [
+    "%env THEANO_FLAGS = 'floatX=float32'\n",
+    "import os\n",
+    "if type(os.environ.get(\"DISPLAY\")) is not str or len(os.environ.get(\"DISPLAY\")) == 0:\n",
+    "    !bash ../xvfb start\n",
+    "    %env DISPLAY = : 1"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import gym\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "\n",
+    "import sklearn.pipeline\n",
+    "import sklearn.preprocessing\n",
+    "from sklearn.kernel_approximation import RBFSampler\n",
+    "\n",
+    "import matplotlib.pyplot as plt\n",
+    "%matplotlib inline\n",
+    "\n",
+    "env = gym.make(\"MountainCar-v0\").env\n",
+    "state = env.reset()\n",
+    "n_actions = env.action_space.n\n",
+    "state_dim = env.observation_space.shape"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Featurizing state"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "FeatureUnion(n_jobs=1,\n",
+       "       transformer_list=[('rbf1', RBFSampler(gamma=5.0, n_components=100, random_state=None)), ('rbf2', RBFSampler(gamma=2.0, n_components=100, random_state=None)), ('rbf3', RBFSampler(gamma=1.0, n_components=100, random_state=None)), ('rbf4', RBFSampler(gamma=0.5, n_components=100, random_state=None))],\n",
+       "       transformer_weights=None)"
+      ]
+     },
+     "execution_count": 3,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# Feature Preprocessing: Normalize to zero mean and unit variance\n",
+    "# We use a few samples from the observation space to do this\n",
+    "observation_examples = np.array([env.observation_space.sample() for x in range(10000)])\n",
+    "scaler = sklearn.preprocessing.StandardScaler()\n",
+    "scaler.fit(observation_examples)\n",
+    "\n",
+    "# Used to converte a state to a featurizes represenation.\n",
+    "# We use RBF kernels with different variances to cover different parts of the space\n",
+    "featurizer = sklearn.pipeline.FeatureUnion([\n",
+    "        (\"rbf1\", RBFSampler(gamma=5.0, n_components=100)),\n",
+    "        (\"rbf2\", RBFSampler(gamma=2.0, n_components=100)),\n",
+    "        (\"rbf3\", RBFSampler(gamma=1.0, n_components=100)),\n",
+    "        (\"rbf4\", RBFSampler(gamma=0.5, n_components=100))\n",
+    "        ])\n",
+    "featurizer.fit(scaler.transform(observation_examples))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def featurize_state(state):\n",
+    "    \"\"\"\n",
+    "    Returns the featurized representation for a state.\n",
+    "    \"\"\"\n",
+    "    scaled = scaler.transform([state])\n",
+    "    featurized = featurizer.transform(scaled)\n",
+    "    return featurized[0]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "featured_shape = featurize_state(state).shape[0]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "((2,), 400)"
+      ]
+     },
+     "execution_count": 6,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "state_dim, featured_shape"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Building the network for REINFORCE"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "For REINFORCE algorithm, we'll need a model that predicts action probabilities given states. Let's define such a model below."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import torch\n",
+    "import torch.nn as nn\n",
+    "import torch.nn.functional as F"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "class Network(nn.Module):\n",
+    "    def __init__(self):\n",
+    "        super(Network, self).__init__()\n",
+    "        self.dense1 = nn.Linear(featured_shape, 200)\n",
+    "        self.dense2 = nn.Linear(200, 500)\n",
+    "        self.dense3 = nn.Linear(500, 1000)\n",
+    "        self.dense4 = nn.Linear(1000, 500)\n",
+    "        self.dense5 = nn.Linear(500, 200)\n",
+    "        self.dense6 = nn.Linear(200, n_actions)\n",
+    "        \n",
+    "    def forward(self, x):\n",
+    "        x = F.relu(self.dense1(x))\n",
+    "        x = F.relu(self.dense2(x))\n",
+    "        x = F.tanh(self.dense3(x))\n",
+    "        x = F.tanh(self.dense4(x))\n",
+    "        x = F.relu(self.dense5(x))\n",
+    "        x = self.dense6(x)\n",
+    "        \n",
+    "        return x"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "agent = Network()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### Predict function"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def predict_proba(states):\n",
+    "    \"\"\" \n",
+    "    Predict action probabilities given states.\n",
+    "    :param states: numpy array of shape [batch, state_shape]\n",
+    "    :returns: numpy array of shape [batch, n_actions]\n",
+    "    \"\"\"\n",
+    "    # convert states, compute logits, use softmax to get probability\n",
+    "    states = torch.tensor([featurize_state(state) for state in states], dtype=torch.float32)\n",
+    "    logits = agent(states)\n",
+    "    policy = F.softmax(logits)\n",
+    "    return policy.data.numpy()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/home/nik-96/anaconda3/lib/python3.6/site-packages/torch/nn/functional.py:1320: UserWarning: nn.functional.tanh is deprecated. Use torch.tanh instead.\n",
+      "  warnings.warn(\"nn.functional.tanh is deprecated. Use torch.tanh instead.\")\n",
+      "/home/nik-96/anaconda3/lib/python3.6/site-packages/ipykernel_launcher.py:10: UserWarning: Implicit dimension choice for softmax has been deprecated. Change the call to include dim=X as an argument.\n",
+      "  # Remove the CWD from sys.path while we load stuff.\n"
+     ]
+    }
+   ],
+   "source": [
+    "test_states = np.array([env.reset() for _ in range(5)])\n",
+    "test_probas = predict_proba(test_states)\n",
+    "assert isinstance(\n",
+    "    test_probas, np.ndarray), \"you must return np array and not %s\" % type(test_probas)\n",
+    "assert tuple(test_probas.shape) == (\n",
+    "    test_states.shape[0], n_actions), \"wrong output shape: %s\" % np.shape(test_probas)\n",
+    "assert np.allclose(np.sum(test_probas, axis=1),\n",
+    "                   1), \"probabilities do not sum to 1\""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Play the game\n",
+    "\n",
+    "We can now use our newly built agent to play the game."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def generate_session(t_max=1000):\n",
+    "    \"\"\" \n",
+    "    play a full session with REINFORCE agent and train at the session end.\n",
+    "    returns sequences of states, actions and rewards\n",
+    "    \"\"\"\n",
+    "\n",
+    "    # arrays to record session\n",
+    "    states, actions, rewards = [], [], []\n",
+    "\n",
+    "    s = env.reset()\n",
+    "\n",
+    "    for t in range(t_max):\n",
+    "\n",
+    "        # action probabilities array aka pi(a|s)\n",
+    "        action_probas = predict_proba(np.array([s]))[0]\n",
+    "\n",
+    "        a = np.random.choice(n_actions, p=action_probas)\n",
+    "\n",
+    "        new_s, r, done, info = env.step(a)\n",
+    "\n",
+    "        # record session history to train later\n",
+    "        states.append(featurize_state(s))\n",
+    "        actions.append(a)\n",
+    "        rewards.append(r)\n",
+    "\n",
+    "        s = new_s\n",
+    "        if done:\n",
+    "            break\n",
+    "\n",
+    "    return states, actions, rewards"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/home/nik-96/anaconda3/lib/python3.6/site-packages/ipykernel_launcher.py:10: UserWarning: Implicit dimension choice for softmax has been deprecated. Change the call to include dim=X as an argument.\n",
+      "  # Remove the CWD from sys.path while we load stuff.\n"
+     ]
+    }
+   ],
+   "source": [
+    "# test it\n",
+    "states, actions, rewards = generate_session()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Computing cumulative rewards"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def get_cumulative_rewards(rewards,  # rewards at each step\n",
+    "                           gamma=0.99  # discount for reward\n",
+    "                           ):\n",
+    "    \"\"\"\n",
+    "    take a list of immediate rewards r(s,a) for the whole session \n",
+    "    compute cumulative returns (a.k.a. G(s,a) in Sutton '16)\n",
+    "    G_t = r_t + gamma*r_{t+1} + gamma^2*r_{t+2} + ...\n",
+    "\n",
+    "    The simple way to compute cumulative rewards is \n",
+    "    to iterate from last to first time tick\n",
+    "    and compute G_t = r_t + gamma*G_{t+1} recurrently\n",
+    "\n",
+    "    You must return an array/list of cumulative rewards with as many elements \n",
+    "    as in the initial rewards.\n",
+    "    \"\"\"\n",
+    "    def G_t(reward_arr, gamma):\n",
+    "        return sum([gamma**index*r for index, r in enumerate(reward_arr)])\n",
+    "    \n",
+    "    G = [G_t(rewards[index:], gamma) for index, r in enumerate(rewards)]\n",
+    "    \n",
+    "    return G"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[1.40049, 1.5561, 1.729, 0.81, 0.9, 1.0, 0.0]\n",
+      "looks good!\n"
+     ]
+    }
+   ],
+   "source": [
+    "get_cumulative_rewards(rewards)\n",
+    "print(get_cumulative_rewards([0, 0, 1, 0, 0, 1, 0], gamma=0.9))\n",
+    "assert len(get_cumulative_rewards(list(range(100)))) == 100, \"check cumulative reward length\"\n",
+    "assert np.allclose(get_cumulative_rewards([0, 0, 1, 0, 0, 1, 0], gamma=0.9), [\n",
+    "                   1.40049, 1.5561, 1.729, 0.81, 0.9, 1.0, 0.0])\n",
+    "assert np.allclose(get_cumulative_rewards(\n",
+    "    [0, 0, 1, -2, 3, -4, 0], gamma=0.5), [0.0625, 0.125, 0.25, -1.5, 1.0, -4.0, 0.0])\n",
+    "assert np.allclose(get_cumulative_rewards(\n",
+    "    [0, 0, 1, 2, 3, 4, 0], gamma=0), [0, 0, 1, 2, 3, 4, 0])\n",
+    "print(\"looks good!\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "#### Loss function and updates\n",
+    "\n",
+    "We now need to define objective and update over policy gradient.\n",
+    "\n",
+    "Our objective function is\n",
+    "\n",
+    "$$ J \\approx  { 1 \\over N } \\sum  _{s_i,a_i} \\pi_\\theta (a_i | s_i) \\cdot G(s_i,a_i) $$\n",
+    "\n",
+    "\n",
+    "Following the REINFORCE algorithm, we can define our objective as follows: \n",
+    "\n",
+    "$$ \\hat J \\approx { 1 \\over N } \\sum  _{s_i,a_i} log \\pi_\\theta (a_i | s_i) \\cdot G(s_i,a_i) $$\n",
+    "\n",
+    "When you compute gradient of that function over network weights $ \\theta $, it will become exactly the policy gradient.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def to_one_hot(y_tensor, n_dims=None):\n",
+    "    \"\"\" helper: take an integer vector and convert it to 1-hot matrix. \"\"\"\n",
+    "    y_tensor = y_tensor.type(torch.LongTensor).view(-1, 1)\n",
+    "    n_dims = n_dims if n_dims is not None else int(torch.max(y_tensor)) + 1\n",
+    "    y_one_hot = torch.zeros(\n",
+    "        y_tensor.size()[0], n_dims).scatter_(1, y_tensor, 1)\n",
+    "    return y_one_hot"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Your code: define optimizers\n",
+    "opt = torch.optim.Adam(agent.parameters(), lr=1e-4)\n",
+    "\n",
+    "\n",
+    "def train_on_session(states, actions, rewards, gamma=0.99):\n",
+    "    \"\"\"\n",
+    "    Takes a sequence of states, actions and rewards produced by generate_session.\n",
+    "    Updates agent's weights by following the policy gradient above.\n",
+    "    Please use Adam optimizer with default parameters.\n",
+    "    \"\"\"\n",
+    "\n",
+    "    # cast everything into torch tensors\n",
+    "    states = torch.tensor(states, dtype=torch.float32)\n",
+    "    actions = torch.tensor(actions, dtype=torch.int32)\n",
+    "    cumulative_returns = np.array(get_cumulative_rewards(rewards, gamma))\n",
+    "    cumulative_returns = torch.tensor(cumulative_returns, dtype=torch.float32)\n",
+    "\n",
+    "    # predict logits, probas and log-probas using an agent.\n",
+    "    logits = agent(states)\n",
+    "    probas = F.softmax(logits)\n",
+    "    logprobas = F.log_softmax(logits)\n",
+    "\n",
+    "    assert all(isinstance(v, torch.Tensor) for v in [logits, probas, logprobas]), \\\n",
+    "        \"please use compute using torch tensors and don't use predict_proba function\"\n",
+    "\n",
+    "    # select log-probabilities for chosen actions, log pi(a_i|s_i)\n",
+    "    logprobas_for_actions = torch.sum(logprobas * to_one_hot(actions), dim=1)\n",
+    "\n",
+    "    # REINFORCE objective function\n",
+    "    J_hat = torch.mean(logprobas_for_actions*cumulative_returns)\n",
+    "\n",
+    "    # regularize with entropy\n",
+    "    # <compute mean entropy of probas. Don't forget the sign!>\n",
+    "    entropy_reg = torch.mean(probas*torch.log(probas))\n",
+    "\n",
+    "    loss = - J_hat - entropy_reg\n",
+    "\n",
+    "    # Gradient descent step\n",
+    "    loss.backward()\n",
+    "    opt.step()\n",
+    "    opt.zero_grad()\n",
+    "\n",
+    "    # technical: return session rewards to print them later\n",
+    "    return np.sum(rewards)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### The actual training"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/home/nik-96/anaconda3/lib/python3.6/site-packages/ipykernel_launcher.py:10: UserWarning: Implicit dimension choice for softmax has been deprecated. Change the call to include dim=X as an argument.\n",
+      "  # Remove the CWD from sys.path while we load stuff.\n",
+      "/home/nik-96/anaconda3/lib/python3.6/site-packages/ipykernel_launcher.py:20: UserWarning: Implicit dimension choice for softmax has been deprecated. Change the call to include dim=X as an argument.\n",
+      "/home/nik-96/anaconda3/lib/python3.6/site-packages/ipykernel_launcher.py:21: UserWarning: Implicit dimension choice for log_softmax has been deprecated. Change the call to include dim=X as an argument.\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "mean reward:-1000.000\n",
+      "mean reward:-1000.000\n",
+      "mean reward:-1000.000\n",
+      "mean reward:-1000.000\n",
+      "mean reward:-1000.000\n",
+      "mean reward:-1000.000\n",
+      "mean reward:-1000.000\n",
+      "mean reward:-1000.000\n",
+      "mean reward:-1000.000\n",
+      "mean reward:-1000.000\n",
+      "mean reward:-1000.000\n",
+      "mean reward:-1000.000\n",
+      "mean reward:-1000.000\n",
+      "mean reward:-1000.000\n"
+     ]
+    },
+    {
+     "ename": "KeyboardInterrupt",
+     "evalue": "",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
+      "\u001b[0;31mKeyboardInterrupt\u001b[0m                         Traceback (most recent call last)",
+      "\u001b[0;32m<timed exec>\u001b[0m in \u001b[0;36m<module>\u001b[0;34m\u001b[0m\n",
+      "\u001b[0;32m<timed exec>\u001b[0m in \u001b[0;36m<listcomp>\u001b[0;34m(.0)\u001b[0m\n",
+      "\u001b[0;32m<ipython-input-12-be218bd7b94b>\u001b[0m in \u001b[0;36mgenerate_session\u001b[0;34m(t_max)\u001b[0m\n\u001b[1;32m     20\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m     21\u001b[0m         \u001b[0;31m# record session history to train later\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m---> 22\u001b[0;31m         \u001b[0mstates\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mappend\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mfeaturize_state\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0ms\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m     23\u001b[0m         \u001b[0mactions\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mappend\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0ma\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m     24\u001b[0m         \u001b[0mrewards\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mappend\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mr\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m<ipython-input-4-7a96e96b50b3>\u001b[0m in \u001b[0;36mfeaturize_state\u001b[0;34m(state)\u001b[0m\n\u001b[1;32m      3\u001b[0m     \u001b[0mReturns\u001b[0m \u001b[0mthe\u001b[0m \u001b[0mfeaturized\u001b[0m \u001b[0mrepresentation\u001b[0m \u001b[0;32mfor\u001b[0m \u001b[0ma\u001b[0m \u001b[0mstate\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m      4\u001b[0m     \"\"\"\n\u001b[0;32m----> 5\u001b[0;31m     \u001b[0mscaled\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mscaler\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mtransform\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0mstate\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m      6\u001b[0m     \u001b[0mfeaturized\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mfeaturizer\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mtransform\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mscaled\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m      7\u001b[0m     \u001b[0;32mreturn\u001b[0m \u001b[0mfeaturized\u001b[0m\u001b[0;34m[\u001b[0m\u001b[0;36m0\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/lib/python3.6/site-packages/sklearn/preprocessing/data.py\u001b[0m in \u001b[0;36mtransform\u001b[0;34m(self, X, y, copy)\u001b[0m\n\u001b[1;32m    679\u001b[0m         \u001b[0mcopy\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mcopy\u001b[0m \u001b[0;32mif\u001b[0m \u001b[0mcopy\u001b[0m \u001b[0;32mis\u001b[0m \u001b[0;32mnot\u001b[0m \u001b[0;32mNone\u001b[0m \u001b[0;32melse\u001b[0m \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mcopy\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    680\u001b[0m         X = check_array(X, accept_sparse='csr', copy=copy, warn_on_dtype=True,\n\u001b[0;32m--> 681\u001b[0;31m                         estimator=self, dtype=FLOAT_DTYPES)\n\u001b[0m\u001b[1;32m    682\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    683\u001b[0m         \u001b[0;32mif\u001b[0m \u001b[0msparse\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0missparse\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mX\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/lib/python3.6/site-packages/sklearn/utils/validation.py\u001b[0m in \u001b[0;36mcheck_array\u001b[0;34m(array, accept_sparse, dtype, order, copy, force_all_finite, ensure_2d, allow_nd, ensure_min_samples, ensure_min_features, warn_on_dtype, estimator)\u001b[0m\n\u001b[1;32m    440\u001b[0m                     \u001b[0;34m\"your data has a single feature or array.reshape(1, -1) \"\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    441\u001b[0m                     \"if it contains a single sample.\".format(array))\n\u001b[0;32m--> 442\u001b[0;31m             \u001b[0marray\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mnp\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0matleast_2d\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0marray\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    443\u001b[0m             \u001b[0;31m# To ensure that array flags are maintained\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    444\u001b[0m             \u001b[0marray\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mnp\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0marray\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0marray\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mdtype\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mdtype\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0morder\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0morder\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mcopy\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mcopy\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/lib/python3.6/site-packages/numpy/core/shape_base.py\u001b[0m in \u001b[0;36matleast_2d\u001b[0;34m(*arys)\u001b[0m\n\u001b[1;32m    121\u001b[0m     \u001b[0mres\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0;34m[\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    122\u001b[0m     \u001b[0;32mfor\u001b[0m \u001b[0mary\u001b[0m \u001b[0;32min\u001b[0m \u001b[0marys\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 123\u001b[0;31m         \u001b[0mary\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0masanyarray\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mary\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    124\u001b[0m         \u001b[0;32mif\u001b[0m \u001b[0mary\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mndim\u001b[0m \u001b[0;34m==\u001b[0m \u001b[0;36m0\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    125\u001b[0m             \u001b[0mresult\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mary\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mreshape\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;36m1\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;36m1\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/lib/python3.6/site-packages/numpy/core/numeric.py\u001b[0m in \u001b[0;36masanyarray\u001b[0;34m(a, dtype, order)\u001b[0m\n\u001b[1;32m    539\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    540\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 541\u001b[0;31m \u001b[0;34m@\u001b[0m\u001b[0mset_module\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m'numpy'\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    542\u001b[0m \u001b[0;32mdef\u001b[0m \u001b[0masanyarray\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0ma\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mdtype\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0;32mNone\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0morder\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0;32mNone\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    543\u001b[0m     \"\"\"Convert the input to an ndarray, but pass ndarray subclasses through.\n",
+      "\u001b[0;31mKeyboardInterrupt\u001b[0m: "
+     ]
+    }
+   ],
+   "source": [
+    "%%time\n",
+    "for i in range(100):\n",
+    "\n",
+    "    rewards = [train_on_session(*generate_session())\n",
+    "               for _ in range(100)]  # generate new sessions\n",
+    "\n",
+    "    print(\"mean reward:%.3f\" % (np.mean(rewards)))\n",
+    "\n",
+    "    if np.mean(rewards) > 90:\n",
+    "        print(\"You Win!\")  # but you can train even further\n",
+    "        break"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Video"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/home/nik-96/anaconda3/lib/python3.6/site-packages/ipykernel_launcher.py:9: UserWarning: Implicit dimension choice for softmax has been deprecated. Change the call to include dim=X as an argument.\n",
+      "  if __name__ == '__main__':\n",
+      "/home/nik-96/anaconda3/lib/python3.6/site-packages/ipykernel_launcher.py:9: UserWarning: Implicit dimension choice for softmax has been deprecated. Change the call to include dim=X as an argument.\n",
+      "  if __name__ == '__main__':\n",
+      "/home/nik-96/anaconda3/lib/python3.6/site-packages/ipykernel_launcher.py:9: UserWarning: Implicit dimension choice for softmax has been deprecated. Change the call to include dim=X as an argument.\n",
+      "  if __name__ == '__main__':\n",
+      "/home/nik-96/anaconda3/lib/python3.6/site-packages/ipykernel_launcher.py:9: UserWarning: Implicit dimension choice for softmax has been deprecated. Change the call to include dim=X as an argument.\n",
+      "  if __name__ == '__main__':\n",
+      "/home/nik-96/anaconda3/lib/python3.6/site-packages/ipykernel_launcher.py:9: UserWarning: Implicit dimension choice for softmax has been deprecated. Change the call to include dim=X as an argument.\n",
+      "  if __name__ == '__main__':\n"
+     ]
+    }
+   ],
+   "source": [
+    "# record sessions\n",
+    "import gym.wrappers\n",
+    "env = gym.wrappers.Monitor(gym.make(\"CartPole-v0\"),\n",
+    "                           directory=\"videos\", force=True)\n",
+    "sessions = [generate_session() for _ in range(100)]\n",
+    "env.close()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "\n",
+       "<video width=\"640\" height=\"480\" controls>\n",
+       "  <source src=\"./videos/openaigym.video.0.10017.video000008.mp4\" type=\"video/mp4\">\n",
+       "</video>\n"
+      ],
+      "text/plain": [
+       "<IPython.core.display.HTML object>"
+      ]
+     },
+     "execution_count": 17,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# show video\n",
+    "from IPython.display import HTML\n",
+    "import os\n",
+    "\n",
+    "video_names = list(\n",
+    "    filter(lambda s: s.endswith(\".mp4\"), os.listdir(\"./videos/\")))\n",
+    "\n",
+    "HTML(\"\"\"\n",
+    "<video width=\"640\" height=\"480\" controls>\n",
+    "  <source src=\"{}\" type=\"video/mp4\">\n",
+    "</video>\n",
+    "\"\"\".format(\"./videos/\"+video_names[-1]))  # this may or may not be _last_ video. Try other indices"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.6.5"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 1
+}
